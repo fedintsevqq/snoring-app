@@ -5,19 +5,20 @@ import subprocess
 import numpy as np
 import pytest
 
+from hrapometr_proto import detect
+from hrapometr_proto.audio import AudioDecodeError
 from hrapometr_proto.detect import (
     HOP_S,
     WIN_S,
     EventParams,
     _load_run,
-    _write_frames,
     analyze_segment,
     detect_events,
     find_audio,
-    quantize_frames,
     summarize,
 )
 from hrapometr_proto.events import Event, frames_to_events
+from hrapometr_proto.frames_io import load_frames, quantize_frames, write_frames
 from hrapometr_proto.windows import Segment
 from hrapometr_proto.yamnet import CLASS_SNORING
 
@@ -85,8 +86,8 @@ def test_find_audio_fails_loudly_when_nothing_usable(tmp_path):
 def test_quantized_frames_equal_what_reuse_reads_back(tmp_path):
     raw = np.array([[0.48751, 0, -40.123456, 0.299996, 0.00004, 0.5, 0.99999]])
     path = tmp_path / "frames.csv"
-    _write_frames(path, quantize_frames(raw))
-    reloaded = np.loadtxt(path, delimiter=",", skiprows=1, ndmin=2)
+    write_frames(path, quantize_frames(raw))
+    reloaded = load_frames(path)
     assert np.array_equal(reloaded, quantize_frames(raw))
     # граничная оценка 0.299996 при пороге 0.3 теперь одинакова и в памяти, и после --reuse
     assert quantize_frames(raw)[0, 3] >= 0.3
@@ -121,6 +122,29 @@ def test_analyze_segment_counts_frames_and_duration(tmp_path):
     assert table[0, 0] == 0.0
     assert table[1, 0] == pytest.approx(HOP_S)
     assert np.all(table[:, 3] == np.float32(0.9))
+
+
+def test_analyze_segment_keeps_audio_read_before_a_decode_error(monkeypatch, tmp_path):
+    block = np.zeros(detect.YAMNET_WIN * 3, dtype=np.float32)
+
+    def broken_after_one_block(path, **kwargs):
+        yield block
+        raise AudioDecodeError("ffmpeg упал в конце файла")
+
+    monkeypatch.setattr(detect, "iter_pcm_blocks", broken_after_one_block)
+    table, duration = analyze_segment(tmp_path / "x.ogg", FakeYamnet(), gain_db=0.0)
+    assert len(table) > 0
+    assert duration == pytest.approx(len(block) / detect.SAMPLE_RATE)
+
+
+def test_analyze_segment_raises_when_nothing_was_read(monkeypatch, tmp_path):
+    def broken_at_once(path, **kwargs):
+        raise AudioDecodeError("не читается")
+        yield  # noqa: unreachable, нужен чтобы функция была генератором
+
+    monkeypatch.setattr(detect, "iter_pcm_blocks", broken_at_once)
+    with pytest.raises(AudioDecodeError):
+        analyze_segment(tmp_path / "x.ogg", FakeYamnet(), gain_db=0.0)
 
 
 def test_analyze_segment_raises_on_unreadable_file(tmp_path):

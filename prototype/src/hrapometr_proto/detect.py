@@ -10,15 +10,23 @@ import argparse
 import json
 import sys
 import time
-import warnings
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 
-from .audio import SAMPLE_RATE, YAMNET_HOP, YAMNET_WIN, frame_stream, iter_pcm_blocks, rms_db
+from .audio import (
+    SAMPLE_RATE,
+    YAMNET_HOP,
+    YAMNET_WIN,
+    AudioDecodeError,
+    frame_stream,
+    iter_pcm_blocks,
+    rms_db,
+)
 from .events import Event, frames_to_events
+from .frames_io import load_frames, quantize_frames, write_frames
 from .timeline import place_segments, segment_number
 from .windows import Segment, segments_from_doc
 from .yamnet import (
@@ -32,8 +40,6 @@ from .yamnet import (
 
 HOP_S = YAMNET_HOP / SAMPLE_RATE
 WIN_S = YAMNET_WIN / SAMPLE_RATE
-FRAMES_HEADER = "t_s,seg,rms_db,snoring,breathing,snort,speech"
-FRAMES_DECIMALS = (3, 0, 2, 4, 4, 4, 4)  # знаков после запятой по колонкам frames.csv
 AUDIO_SUFFIXES = {".ogg", ".opus", ".wav", ".m4a", ".mp3", ".flac"}
 MIN_AUDIO_BYTES = 1024  # файлы меньше считаем мусором (оборванная запись, пустышка)
 GAP_WARNING_S = 120.0  # на столько запись может отличаться от времени на часах без предупреждения
@@ -43,8 +49,8 @@ GAP_WARNING_S = 120.0  # на столько запись может отлич�
 class EventParams:
     threshold: float = 0.3
     max_gap_s: float = 6.0
-    # один кадр длится 0.975 с, два подряд — 1.46 с. Порог 1.4 с означает «минимум два кадра подряд»:
-    # одиночный всплеск оценки эпизодом не считаем.
+    # Один кадр длится 0.975 с, поэтому одиночный всплеск оценки эпизодом не считаем. Два кадра
+    # склеиваются, если пауза между ними не больше max_gap_s, и тогда эпизод не короче 1.46 с.
     min_duration_s: float = 1.4
 
 
@@ -64,16 +70,12 @@ def find_audio(path: Path) -> list[Path]:
     return files
 
 
-def quantize_frames(frames: np.ndarray) -> np.ndarray:
-    """Округляет колонки так же, как они пишутся в frames.csv, чтобы --reuse давал те же эпизоды."""
-    result = frames.copy()
-    for column, decimals in enumerate(FRAMES_DECIMALS):
-        result[:, column] = np.round(result[:, column], decimals)
-    return result
-
-
 def analyze_segment(path: Path, model: Yamnet, *, gain_db: float) -> tuple[np.ndarray, float]:
-    """Прогоняет один файл через модель. Возвращает таблицу кадров (время от начала файла) и длину файла в секундах."""
+    """Прогоняет один файл через модель. Возвращает таблицу кадров (время от начала файла) и длину файла в секундах.
+
+    Если ffmpeg споткнулся в конце файла, уже прочитанный звук оставляем (с предупреждением).
+    Если не прочитано ничего, поднимаем AudioDecodeError.
+    """
     samples = 0
 
     def counted_blocks():
@@ -83,21 +85,26 @@ def analyze_segment(path: Path, model: Yamnet, *, gain_db: float) -> tuple[np.nd
             yield block
 
     rows = []
-    for k, frame in enumerate(frame_stream(counted_blocks())):
-        scores = model.scores(frame)
-        rows.append(
-            (
-                k * HOP_S,
-                0,
-                rms_db(frame),
-                scores[CLASS_SNORING],
-                scores[CLASS_BREATHING],
-                scores[CLASS_SNORT],
-                scores[CLASS_SPEECH],
+    try:
+        for k, frame in enumerate(frame_stream(counted_blocks())):
+            scores = model.scores(frame)
+            rows.append(
+                (
+                    k * HOP_S,
+                    0,
+                    rms_db(frame),
+                    scores[CLASS_SNORING],
+                    scores[CLASS_BREATHING],
+                    scores[CLASS_SNORT],
+                    scores[CLASS_SPEECH],
+                )
             )
-        )
-        if k % 1200 == 1199:
-            print(f"  {path.name}: {(k + 1) * HOP_S / 60:.0f} мин", flush=True)
+            if k % 1200 == 1199:
+                print(f"  {path.name}: {(k + 1) * HOP_S / 60:.0f} мин", flush=True)
+    except AudioDecodeError as error:
+        if not rows:
+            raise
+        print(f"  ВНИМАНИЕ: {path.name} прочитан не до конца ({error}). Беру то, что успели прочитать.")
     table = np.array(rows, dtype=np.float64).reshape(-1, 7)
     return table, samples / SAMPLE_RATE
 
@@ -139,17 +146,8 @@ def summarize(frames: np.ndarray, segments: list[Segment], events: list[Event]) 
     }
 
 
-def _write_frames(path: Path, frames: np.ndarray) -> None:
-    fmt = [f"%.{decimals}f" for decimals in FRAMES_DECIMALS]
-    np.savetxt(path, frames, delimiter=",", header=FRAMES_HEADER, comments="", fmt=fmt)
-
-
 def _load_run(out_dir: Path) -> tuple[np.ndarray, list[Segment], dict]:
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", UserWarning)  # «input contained no data» для пустой ночи
-        frames = np.loadtxt(out_dir / "frames.csv", delimiter=",", skiprows=1, ndmin=2)
-    if frames.size == 0:
-        frames = np.empty((0, 7))
+    frames = load_frames(out_dir / "frames.csv")
     doc = json.loads((out_dir / "segments.json").read_text("utf-8"))
     if isinstance(doc, list):  # старый формат без gain_db
         doc = {"gain_db": 0.0, "segments": doc}
@@ -215,7 +213,7 @@ def _analyze_night(
         print(f"Файл {number} из {len(files)}: {path.name}", flush=True)
         try:
             table, duration = analyze_segment(path, model, gain_db=gain_db)
-        except RuntimeError as error:
+        except AudioDecodeError as error:
             print(f"  ПРОПУСКАЮ {path.name}: {error}")
             tables.append(None)
             durations.append(None)
@@ -226,6 +224,12 @@ def _analyze_night(
         raise ValueError("Ни один файл не удалось прочитать.")
 
     nominal_s = float(session["segment_s"]) if session and session.get("segment_s") else 3600.0
+    unnumbered = [p.name for p in files if segment_number(p.name) is None]
+    if session and session.get("runs") and unnumbered:
+        print(
+            f"ВНИМАНИЕ: файлы без номера seg_N: {', '.join(unnumbered)}. "
+            "Перерывы записи при расчёте времени не учитываются."
+        )
     starts = place_segments(
         [segment_number(p.name) for p in files], durations, _runs_from_session(session), nominal_s
     )
@@ -268,7 +272,7 @@ def run(
     else:
         gain_db = 0.0 if gain_db is None else gain_db
         frames, segments, started_at, _ = _analyze_night(audio_input, out_dir, model_path, gain_db)
-        _write_frames(frames_path, frames)
+        write_frames(frames_path, frames)
         segments_path.write_text(
             json.dumps(
                 {

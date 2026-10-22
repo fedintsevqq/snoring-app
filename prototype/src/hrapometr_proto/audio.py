@@ -14,6 +14,10 @@ YAMNET_HOP = 7800  # половина окна
 _FLOOR = 1e-9
 
 
+class AudioDecodeError(RuntimeError):
+    """ffmpeg не смог прочитать файл до конца. Звук, отданный до ошибки, остаётся годным."""
+
+
 def rms_db(frame: np.ndarray) -> float:
     """Громкость кадра в dBFS. Тишина даёт около -180, а не -inf."""
     rms = float(np.sqrt(np.mean(np.square(frame, dtype=np.float64))))
@@ -76,7 +80,7 @@ def iter_pcm_blocks(
             yield apply_gain_db(np.frombuffer(raw[:usable], dtype="<f4"), gain_db)
         proc.wait()
         if proc.returncode != 0:
-            raise RuntimeError(f"ffmpeg не смог прочитать {path} (код {proc.returncode})")
+            raise AudioDecodeError(f"ffmpeg не смог прочитать {path} (код {proc.returncode})")
 
 
 def frame_stream(

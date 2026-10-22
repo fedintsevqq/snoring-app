@@ -6,8 +6,9 @@ import math
 from dataclasses import dataclass
 
 _Z95 = 1.96
-# Интервал полноты строим из двух независимых долей. Чтобы вместе они гарантированно покрывали 95%,
-# каждая берётся с покрытием не меньше 97.5% (z = 2.24): 0.975 * 0.975 > 0.95.
+# Интервал полноты строим из двух независимых долей. Чтобы вместе они покрывали около 95%,
+# каждая берётся с покрытием около 97.5% (z = 2.24): 0.975 * 0.975 > 0.95. Интервал Уилсона
+# приближённый, поэтому «около», а не «гарантированно».
 _Z_JOINT95 = 2.24
 
 
@@ -87,7 +88,7 @@ def estimate_metrics(
     precision — доля окон с настоящим храпом среди помеченных детектором.
     miss_rate — доля окон с храпом среди непомеченных.
     recall — храп в помеченных / (храп в помеченных + пропущенный храп), группы взвешены размером.
-    Интервал полноты считаем по границам двух долей (z = 2.24), так что он покрывает не меньше 95%.
+    Интервал полноты считаем по границам двух долей (z = 2.24), он покрывает около 95%.
     «Не уверен» в оценку не входит, а крайние случаи по ним отдельно: *_unsure_range.
     """
     f_n, f_unsure, f_hits = _share(flagged_labels)
@@ -98,21 +99,26 @@ def estimate_metrics(
     precision_ci = wilson_interval(f_hits, f_n) if f_n else None
     miss_rate_ci = wilson_interval(u_hits, u_n) if u_n else None
 
+    # Пустая группа в ночи (детектор не пометил ни одного окна или пометил все) не требует разметки:
+    # в ней найдено 0 или пропущено 0 по определению.
+    p_for_recall = 0.0 if flagged_total == 0 else precision
+    m_for_recall = 0.0 if unflagged_total == 0 else miss_rate
+
     recall = recall_ci = None
-    if precision is not None and miss_rate is not None:
-        recall = _recall(precision, miss_rate, flagged_total, unflagged_total)
+    if p_for_recall is not None and m_for_recall is not None:
+        recall = _recall(p_for_recall, m_for_recall, flagged_total, unflagged_total)
         if recall is not None:
             recall_ci = _recall_range(
-                wilson_interval(f_hits, f_n, _Z_JOINT95),
-                wilson_interval(u_hits, u_n, _Z_JOINT95),
+                (0.0, 0.0) if flagged_total == 0 else wilson_interval(f_hits, f_n, _Z_JOINT95),
+                (0.0, 0.0) if unflagged_total == 0 else wilson_interval(u_hits, u_n, _Z_JOINT95),
                 flagged_total,
                 unflagged_total,
             )
 
     precision_unsure_range = miss_rate_unsure_range = recall_unsure_range = None
     if f_unsure + u_unsure > 0:
-        p_range = _unsure_range(f_hits, f_n, f_unsure)
-        m_range = _unsure_range(u_hits, u_n, u_unsure)
+        p_range = (0.0, 0.0) if flagged_total == 0 else _unsure_range(f_hits, f_n, f_unsure)
+        m_range = (0.0, 0.0) if unflagged_total == 0 else _unsure_range(u_hits, u_n, u_unsure)
         precision_unsure_range, miss_rate_unsure_range = p_range, m_range
         if p_range is not None and m_range is not None:
             recall_unsure_range = _recall_range(p_range, m_range, flagged_total, unflagged_total)

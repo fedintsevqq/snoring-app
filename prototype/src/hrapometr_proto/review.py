@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import random
 import secrets
@@ -20,6 +21,7 @@ import numpy as np
 
 from .audio import SAMPLE_RATE, iter_pcm_blocks, normalize_level
 from .events import Event
+from .frames_io import load_frames
 from .review_page import render_page
 from .stats import Metrics, estimate_metrics
 from .sweep import WindowSample, sweep_thresholds
@@ -79,10 +81,14 @@ def split_labels(
     return flagged, unflagged, dict(reasons)
 
 
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def _segment_path(raw: str, run_dir: Path) -> Path:
     """Путь к куску ночи. Если папку перенесли (в том числе с Windows на Mac), ищем по имени рядом."""
     path = Path(raw)
-    if path.exists():
+    if path.is_absolute() and path.exists():
         return path
     return run_dir / PureWindowsPath(raw).name
 
@@ -116,7 +122,11 @@ def prepare(run_dir: Path, per_group: int, win_s: float, seed: int) -> None:
     review_dir = run_dir / "review"
     clips_dir = review_dir / "clips"
     clips_dir.mkdir(parents=True, exist_ok=True)
-    for old in clips_dir.glob("c*.wav"):  # клипы прошлой выборки не должны путаться с новыми
+    # Сначала убираем всё от прошлой выборки. Если нарезка упадёт посередине, страницы и ключа
+    # не останется вовсе, и report честно скажет «сначала prepare», а не примет ответы к чужим клипам.
+    for stale in (review_dir / "key.json", review_dir / "index.html", review_dir / "report.md"):
+        stale.unlink(missing_ok=True)
+    for old in clips_dir.glob("c*.wav"):
         old.unlink()
     by_index = {s.index: s for s in segments}
 
@@ -137,6 +147,8 @@ def prepare(run_dir: Path, per_group: int, win_s: float, seed: int) -> None:
     token = secrets.token_hex(6)
     key = {
         "token": token,
+        # отпечаток frames.csv: sweep откажется работать, если ночь пересчитали после prepare
+        "frames_sha256": _file_sha256(run_dir / "frames.csv"),
         "window_s": win_s,
         "seed": seed,
         "flagged_total": classes.count(FLAGGED),
@@ -198,9 +210,13 @@ def format_report(run_name: str, key: dict, metrics: Metrics, reasons: dict[str,
 
 
 def _load_labels(run_dir: Path, labels_path: Path) -> tuple[dict, dict]:
-    key = json.loads((run_dir / "review" / "key.json").read_text("utf-8"))
+    key_path = run_dir / "review" / "key.json"
+    if not key_path.exists():
+        raise ValueError(f"Нет {key_path}. Сначала выполните prepare.")
+    key = json.loads(key_path.read_text("utf-8"))
     doc = json.loads(labels_path.read_text("utf-8"))
     validate_labels_doc(key, doc)
+    split_labels(key, doc["labels"])  # заодно проверяет, что нет опечаток в метках
     return key, doc["labels"]
 
 
@@ -221,7 +237,12 @@ def report(run_dir: Path, labels_path: Path) -> None:
 def sweep(run_dir: Path, labels_path: Path) -> None:
     """Точность и полнота при других порогах по тем же размеченным окнам."""
     key, labels = _load_labels(run_dir, labels_path)
-    frames = np.loadtxt(run_dir / "frames.csv", delimiter=",", skiprows=1, ndmin=2)
+    if key.get("frames_sha256") != _file_sha256(run_dir / "frames.csv"):
+        raise ValueError(
+            "frames.csv изменился после prepare (ночь прогнали заново). Оценки окон не совпадут с "
+            "разметкой. Запустите prepare и разметьте заново."
+        )
+    frames = load_frames(run_dir / "frames.csv")
     times, scores = frames[:, 0], frames[:, 3]
 
     samples = []
@@ -274,7 +295,7 @@ def main() -> int:
             report(args.run_dir, args.labels)
         else:
             sweep(args.run_dir, args.labels)
-    except ValueError as error:
+    except (ValueError, RuntimeError, FileNotFoundError) as error:
         print(f"Ошибка: {error}")
         return 1
     return 0

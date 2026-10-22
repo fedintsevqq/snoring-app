@@ -94,6 +94,37 @@ def test_recall_is_none_when_no_snoring_anywhere():
     assert result.recall_ci is None
 
 
+def test_threshold_too_high_nothing_flagged_recall_is_zero_without_flagged_labels():
+    # детектор не пометил ни одного окна, а в непомеченных есть храп
+    result = estimate_metrics(
+        flagged_total=0,
+        unflagged_total=100,
+        flagged_labels=[],
+        unflagged_labels=[True, False, False, False],
+    )
+    assert result.precision is None
+    assert result.recall == 0.0
+    assert result.recall_ci[0] == 0.0
+
+
+def test_everything_flagged_recall_is_full_without_unflagged_labels():
+    result = estimate_metrics(
+        flagged_total=100,
+        unflagged_total=0,
+        flagged_labels=[True, True, False],
+        unflagged_labels=[],
+    )
+    assert result.recall == 1.0
+    assert result.recall_ci[1] == 1.0
+
+
+def test_no_flagged_and_no_snoring_anywhere_is_still_undefined():
+    result = estimate_metrics(
+        flagged_total=0, unflagged_total=100, flagged_labels=[], unflagged_labels=[False] * 4
+    )
+    assert result.recall is None
+
+
 def test_unsure_ranges_cover_both_extremes():
     result = estimate_metrics(
         flagged_total=100,

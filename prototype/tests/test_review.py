@@ -2,7 +2,56 @@ import numpy as np
 import pytest
 
 from hrapometr_proto.audio import normalize_level
-from hrapometr_proto.review import split_labels, validate_labels_doc
+from hrapometr_proto.review import _segment_path, split_labels, sweep, validate_labels_doc
+
+
+def test_segment_name_is_looked_up_in_run_dir_not_in_current_directory(tmp_path):
+    run_dir = tmp_path / "night"
+    run_dir.mkdir()
+    assert _segment_path("seg_0000.ogg", run_dir) == run_dir / "seg_0000.ogg"
+    # путь, записанный на Windows, на Mac превращается в имя файла рядом с записью
+    assert _segment_path("runs\\night\\seg_0001.ogg", run_dir) == run_dir / "seg_0001.ogg"
+
+
+def test_sweep_refuses_stale_frames(tmp_path):
+    review = tmp_path / "review"
+    review.mkdir()
+    (tmp_path / "frames.csv").write_text("t_s,seg,rms_db,snoring,breathing,snort,speech\n")
+    (review / "key.json").write_text(
+        '{"token": "t", "frames_sha256": "not-the-real-hash", "clips": {"c001": {"group": "flagged", '
+        '"start_s": 0, "end_s": 30}}, "flagged_total": 1, "unflagged_total": 1}'
+    )
+    labels = tmp_path / "labels.json"
+    labels.write_text('{"token": "t", "labels": {"c001": "snore"}}')
+    with pytest.raises(ValueError, match="frames.csv изменился"):
+        sweep(tmp_path, labels)
+
+
+def test_report_without_prepare_says_so(tmp_path):
+    labels = tmp_path / "labels.json"
+    labels.write_text('{"token": "t", "labels": {}}')
+    with pytest.raises(ValueError, match="prepare"):
+        from hrapometr_proto.review import report
+
+        report(tmp_path, labels)
+
+
+def test_sweep_rejects_mistyped_labels(tmp_path):
+    import hashlib
+
+    review = tmp_path / "review"
+    review.mkdir()
+    frames = tmp_path / "frames.csv"
+    frames.write_text("t_s,seg,rms_db,snoring,breathing,snort,speech\n")
+    digest = hashlib.sha256(frames.read_bytes()).hexdigest()
+    (review / "key.json").write_text(
+        '{"token": "t", "frames_sha256": "%s", "clips": {"c001": {"group": "flagged", '
+        '"start_s": 0, "end_s": 30}}, "flagged_total": 1, "unflagged_total": 1}' % digest
+    )
+    labels = tmp_path / "labels.json"
+    labels.write_text('{"token": "t", "labels": {"c001": "Snore"}}')
+    with pytest.raises(ValueError, match="Неизвестная метка"):
+        sweep(tmp_path, labels)
 
 
 def test_normalize_level_brings_typical_loudness_to_target():

@@ -3,8 +3,10 @@
 Запуск:  python -m hrapometr_proto.record --out runs/night-1
 Остановка: Ctrl+C (ffmpeg корректно закрывает последний файл).
 
-Если ffmpeg упал или завис (отвалился микрофон), запись перезапускается в новые куски. Все запуски
-и перезапуски записываются в session.json, а ошибки ffmpeg — в ffmpeg.log рядом с записью.
+Если ffmpeg упал или завис (отвалился микрофон), запись перезапускается в новые куски с паузой.
+Зависание определяем по прогрессу самого ffmpeg (-progress), а не по размеру файлов: файл растёт
+рывками и в тихой комнате может стоять на нуле несколько минут.
+Все запуски записываются в session.json, ошибки ffmpeg — в ffmpeg.log рядом с записью.
 """
 
 from __future__ import annotations
@@ -13,9 +15,14 @@ import argparse
 import json
 import platform
 import re
+import shutil
+import signal
 import subprocess
 import sys
+import threading
 import time
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -26,9 +33,12 @@ from .timeline import segment_number
 
 PREFLIGHT_S = 3  # столько секунд слушаем микрофон перед стартом
 SILENCE_FLOOR_DB = -90.0  # тише — это цифровая тишина (нет доступа к микрофону, не то устройство)
-STALL_S = 180  # столько секунд файлы не растут — ffmpeg завис
-DEFAULT_MAX_RESTARTS = 10
+STALL_S = 120  # столько секунд ffmpeg не двигает время записи — считаем, что завис
+PROGRESS_PERIOD_S = 5  # как часто ffmpeg сообщает прогресс
+HEALTHY_RUN_S = 600  # запуск дольше этого считаем удачным и сбрасываем счётчик неудач
+DEFAULT_MAX_RESTARTS = 30  # неудач подряд, после которых сдаёмся
 DEFAULT_RESTART_DELAY_S = 5.0
+MAX_RESTART_DELAY_S = 60.0
 
 
 def build_ffmpeg_command(
@@ -39,7 +49,10 @@ def build_ffmpeg_command(
     bitrate: str,
     start_number: int = 0,
 ) -> list[str]:
-    """Команда записи: вход -> моно 16 кГц -> Opus -> файлы seg_0000.ogg, seg_0001.ogg ..."""
+    """Команда записи: вход -> моно 16 кГц -> Opus -> файлы seg_0000.ogg, seg_0001.ogg ...
+
+    Прогресс уходит в stdout (-progress pipe:1): по нему мы видим, что запись идёт.
+    """
     pattern = str(Path(out_dir) / "seg_%04d.ogg")
     return [
         "ffmpeg", "-hide_banner", "-loglevel", "warning",
@@ -48,6 +61,7 @@ def build_ffmpeg_command(
         "-c:a", "libopus", "-b:a", bitrate,
         "-f", "segment", "-segment_time", f"{segment_s:g}", "-reset_timestamps", "1",
         "-segment_start_number", str(start_number),
+        "-progress", "pipe:1", "-stats_period", str(PROGRESS_PERIOD_S),
         pattern,
     ]  # fmt: skip
 
@@ -99,6 +113,49 @@ def classify_exit(
     return "restart"
 
 
+def restart_delay(attempt: int, base_s: float, cap_s: float = MAX_RESTART_DELAY_S) -> float:
+    """Пауза перед перезапуском номер attempt (с единицы): base, 2*base, 4*base ... не больше cap."""
+    return min(base_s * 2 ** max(attempt - 1, 0), cap_s)
+
+
+_PROGRESS_LINE = re.compile(r"^out_time_(?:us|ms)=(\d+)\s*$")  # в ffmpeg обе метки — микросекунды
+
+
+def parse_progress_line(line: str) -> int | None:
+    """Время записи в микросекундах из строки прогресса ffmpeg; для остальных строк и N/A — None."""
+    match = _PROGRESS_LINE.match(line)
+    return int(match.group(1)) if match else None
+
+
+class ProgressMonitor:
+    """Следит, что время записи в ffmpeg растёт. Кормится строками из его stdout."""
+
+    def __init__(self, stall_s: float = STALL_S, clock: Callable[[], float] = time.monotonic) -> None:
+        self._stall_s = stall_s
+        self._clock = clock
+        self._last_us = -1
+        self._last_advance = clock()
+
+    def feed(self, line: str) -> None:
+        value = parse_progress_line(line)
+        if value is not None and value > self._last_us:
+            self._last_us = value
+            self._last_advance = self._clock()
+
+    def stalled(self) -> bool:
+        return self._clock() - self._last_advance >= self._stall_s
+
+    @property
+    def recorded_s(self) -> float:
+        return max(self._last_us, 0) / 1_000_000
+
+
+def _pump_progress(stream, monitor: ProgressMonitor) -> None:
+    """Читает stdout ffmpeg до конца. Читать надо всегда: иначе ffmpeg встанет на полном буфере."""
+    for raw in stream:
+        monitor.feed(raw.decode("utf-8", errors="replace").strip())
+
+
 def _list_devices_output() -> str:
     result = subprocess.run(
         ["ffmpeg", "-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
@@ -142,31 +199,33 @@ def _write_session(out_dir: Path, data: dict) -> None:
     (out_dir / "session.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
 
 
-def _tail(path: Path, lines: int = 5) -> str:
+def _tail_since(path: Path, offset: int, lines: int = 5) -> str:
+    """Последние строки лога, добавленные после байта offset (ошибки текущего запуска, не прошлых)."""
     try:
-        return "\n".join(path.read_text("utf-8", errors="replace").splitlines()[-lines:])
+        with path.open("rb") as handle:
+            handle.seek(offset)
+            text = handle.read().decode("utf-8", errors="replace")
     except OSError:
         return ""
+    return "\n".join(text.splitlines()[-lines:])
 
 
-def _watch(proc: subprocess.Popen, out_dir: Path) -> bool:
-    """Ждёт конца ffmpeg. True — завис (файлы STALL_S секунд не растут), False — завершился сам."""
-    now = time.monotonic()
-    last_report = last_check = last_growth = now
-    last_size = _dir_size_bytes(out_dir)
+def _watch(
+    proc: subprocess.Popen,
+    monitor: ProgressMonitor,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> bool:
+    """Ждёт конца ffmpeg. True — завис (время записи не растёт STALL_S секунд), False — завершился сам."""
+    last_report = clock()
     while proc.poll() is None:
-        time.sleep(1)
-        now = time.monotonic()
-        if now - last_check >= 10:
-            last_check = now
-            size = _dir_size_bytes(out_dir)
-            if size != last_size:
-                last_size, last_growth = size, now
-        if now - last_growth >= STALL_S:
+        sleep(1)
+        if monitor.stalled():
             return True
-        if now - last_report >= 60:
-            last_report = now
-            print(f"{datetime.now():%H:%M} записано {last_size / 1_000_000:.1f} МБ", flush=True)
+        if clock() - last_report >= 60:
+            last_report = clock()
+            print(f"{datetime.now():%H:%M} записано {monitor.recorded_s / 3600:.2f} ч", flush=True)
     return False
 
 
@@ -177,7 +236,7 @@ def _stop_process(proc: subprocess.Popen) -> int | None:
             if proc.stdin:
                 proc.stdin.write(b"q")
                 proc.stdin.flush()
-        except OSError:
+        except (OSError, ValueError):
             pass
         try:
             proc.wait(timeout=30)
@@ -191,6 +250,56 @@ def _stop_process(proc: subprocess.Popen) -> int | None:
     return proc.returncode
 
 
+@dataclass(frozen=True)
+class RunResult:
+    stalled: bool
+    interrupted: bool
+    returncode: int | None
+    duration_s: float
+
+
+def _run_once(cmd: list[str], log, *, keep_awake_enabled: bool) -> RunResult:
+    """Один запуск ffmpeg от старта до остановки. Процессы за собой убирает всегда."""
+    started = time.monotonic()
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log)
+    keep_awake = None
+    stalled = interrupted = False
+    try:
+        monitor = ProgressMonitor()
+        threading.Thread(target=_pump_progress, args=(proc.stdout, monitor), daemon=True).start()
+        if keep_awake_enabled:
+            # -i: не засыпать от простоя, -s: не засыпать системе при работе от сети, -w: до конца ffmpeg
+            keep_awake = subprocess.Popen(["caffeinate", "-i", "-s", "-w", str(proc.pid)])
+        try:
+            stalled = _watch(proc, monitor)
+        except KeyboardInterrupt:
+            interrupted = True
+            print("Останавливаю запись...")
+        returncode = _stop_process(proc)
+    finally:
+        _stop_process(proc)
+        if proc.stdin:
+            proc.stdin.close()
+        if keep_awake is not None:
+            keep_awake.terminate()
+            try:
+                keep_awake.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                keep_awake.kill()
+    return RunResult(stalled, interrupted, None if stalled else returncode, time.monotonic() - started)
+
+
+def _raise_keyboard_interrupt(signum, frame) -> None:
+    raise KeyboardInterrupt
+
+
+def _install_stop_signals() -> None:
+    """Закрытие окна Терминала (SIGHUP) и kill (SIGTERM) останавливают запись так же, как Ctrl+C."""
+    for name in ("SIGTERM", "SIGHUP"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), _raise_keyboard_interrupt)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Запись ночи (Opus, моно, куски по часу)")
     parser.add_argument("--out", type=Path, help="папка для ночи, например runs/night-1")
@@ -199,13 +308,21 @@ def main() -> int:
     parser.add_argument("--segment-min", type=float, default=60.0, help="длина куска, минут")
     parser.add_argument("--bitrate", default="16k", help="битрейт Opus (по умолчанию 16k)")
     parser.add_argument("--skip-check", action="store_true", help="не проверять микрофон перед стартом")
-    parser.add_argument("--max-restarts", type=int, default=DEFAULT_MAX_RESTARTS)
-    parser.add_argument("--restart-delay", type=float, default=DEFAULT_RESTART_DELAY_S)
+    parser.add_argument("--max-restarts", type=int, default=DEFAULT_MAX_RESTARTS, help="сколько неудачных запусков подряд терпеть")
+    parser.add_argument("--restart-delay", type=float, default=DEFAULT_RESTART_DELAY_S, help="пауза перед первым перезапуском, секунд (дальше растёт до минуты)")
     parser.add_argument(
         "--test-seconds", type=float, default=0.0,
         help="проверка без микрофона: пишет тестовый тон N секунд",
     )  # fmt: skip
+    parser.add_argument(
+        "--test-realtime", action="store_true",
+        help="с --test-seconds: тон идёт в реальном времени (можно проверить перезапуск, убив ffmpeg)",
+    )  # fmt: skip
     args = parser.parse_args()
+
+    if shutil.which("ffmpeg") is None:
+        print("Не найден ffmpeg. Установите: brew install ffmpeg")
+        return 2
 
     is_mac = platform.system() == "Darwin"
     if args.list_devices:
@@ -216,7 +333,11 @@ def main() -> int:
 
     finite_input = args.test_seconds > 0
     if finite_input:
-        input_args = ["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=16000", "-t", f"{args.test_seconds:g}"]
+        input_args = [
+            *(["-re"] if args.test_realtime else []),
+            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=16000",
+            "-t", f"{args.test_seconds:g}",
+        ]  # fmt: skip
     elif is_mac:
         input_args = ["-f", "avfoundation", "-i", f":{args.device}"]
     else:
@@ -264,81 +385,76 @@ def main() -> int:
 
     if is_mac:
         _check_power()
+    _install_stop_signals()
     print(f"Пишу в {out_dir}. Остановить: Ctrl+C.")
 
     log_path = out_dir / "ffmpeg.log"
-    interrupted = False
     gave_up = False
-    restarts = 0
-    with log_path.open("ab") as log:
-        while True:
-            start_number = next_segment_number(out_dir)
-            session["runs"] = [
-                *session["runs"],
-                {"started_at": datetime.now().astimezone().isoformat(timespec="seconds"), "first_segment": start_number},
-            ]
-            _write_session(out_dir, session)
-            cmd = build_ffmpeg_command(
-                input_args=input_args, out_dir=out_dir, segment_s=segment_s,
-                bitrate=args.bitrate, start_number=start_number,
-            )  # fmt: skip
-            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=log)
-            keep_awake = None
-            if is_mac:
-                # -i: не засыпать от простоя, -s: не засыпать системе при работе от сети, -w: до конца ffmpeg
-                keep_awake = subprocess.Popen(["caffeinate", "-i", "-s", "-w", str(proc.pid)])
+    restarts = 0  # всего перезапусков за ночь
+    failures_in_row = 0
+    try:
+        with log_path.open("ab") as log:
+            while True:
+                start_number = next_segment_number(out_dir)
+                session["runs"] = [
+                    *session["runs"],
+                    {
+                        "started_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                        "first_segment": start_number,
+                    },
+                ]
+                _write_session(out_dir, session)
+                cmd = build_ffmpeg_command(
+                    input_args=input_args, out_dir=out_dir, segment_s=segment_s,
+                    bitrate=args.bitrate, start_number=start_number,
+                )  # fmt: skip
+                log.flush()
+                log_offset = log_path.stat().st_size
 
-            stalled = False
-            try:
-                stalled = _watch(proc, out_dir)
-            except KeyboardInterrupt:
-                interrupted = True
-                print("Останавливаю запись...")
-            returncode = _stop_process(proc)
-            if keep_awake is not None:
-                keep_awake.terminate()
+                result = _run_once(cmd, log, keep_awake_enabled=is_mac)
+                decision = classify_exit(
+                    returncode=result.returncode,
+                    stalled=result.stalled,
+                    interrupted=result.interrupted,
+                    finite_input=finite_input,
+                )
+                if decision == "done":
+                    break
 
-            decision = classify_exit(
-                returncode=None if stalled else returncode,
-                stalled=stalled,
-                interrupted=interrupted,
-                finite_input=finite_input,
-            )
-            if decision == "done":
-                break
+                restarts += 1
+                failures_in_row = 1 if result.duration_s >= HEALTHY_RUN_S else failures_in_row + 1
+                session["restarts"] = restarts
+                reason = (
+                    "завис (время записи не растёт)" if result.stalled
+                    else f"остановился с кодом {result.returncode}"
+                )  # fmt: skip
+                print(f"\n!!! {datetime.now():%H:%M} ffmpeg {reason}.")
+                print(_tail_since(log_path, log_offset))
+                if failures_in_row > args.max_restarts:
+                    gave_up = True
+                    break
+                delay = restart_delay(failures_in_row, args.restart_delay)
+                print(f"Перезапуск через {delay:g} с (неудач подряд: {failures_in_row} из {args.max_restarts}).")
+                time.sleep(delay)
+    except KeyboardInterrupt:
+        print("Останавливаю запись...")
+    finally:
+        ended = datetime.now().astimezone()
+        hours = (ended - started).total_seconds() / 3600
+        size_mb = _dir_size_bytes(out_dir) / 1_000_000
+        session = {
+            **session,
+            "ended_at": ended.isoformat(timespec="seconds"),
+            "hours": round(hours, 3),
+            "size_mb": round(size_mb, 2),
+            "mb_per_hour": round(size_mb / hours, 2) if hours > 0 else None,
+            "gave_up": gave_up,
+        }
+        _write_session(out_dir, session)
 
-            restarts += 1
-            session["restarts"] = restarts
-            reason = "завис (файлы перестали расти)" if stalled else f"остановился с кодом {returncode}"
-            print(f"\n!!! {datetime.now():%H:%M} ffmpeg {reason}.")
-            print(_tail(log_path))
-            if restarts > args.max_restarts:
-                gave_up = True
-                break
-            print(f"Перезапуск {restarts} из {args.max_restarts}.")
-            try:
-                time.sleep(args.restart_delay)
-            except KeyboardInterrupt:
-                interrupted = True
-                break
-
-    ended = datetime.now().astimezone()
-    hours = (ended - started).total_seconds() / 3600
-    size_mb = _dir_size_bytes(out_dir) / 1_000_000
-    has_audio = size_mb > 0
-    session = {
-        **session,
-        "ended_at": ended.isoformat(timespec="seconds"),
-        "hours": round(hours, 3),
-        "size_mb": round(size_mb, 2),
-        "mb_per_hour": round(size_mb / hours, 2) if hours > 0 else None,
-        "gave_up": gave_up,
-    }
-    _write_session(out_dir, session)
-
-    if gave_up or not has_audio:
+    if gave_up or size_mb == 0:
         print(
-            f"\nЗАПИСЬ НЕ УДАЛАСЬ: ffmpeg не заработал даже после {args.max_restarts} перезапусков. "
+            f"\nЗАПИСЬ НЕ УДАЛАСЬ: ffmpeg не заработал даже после {args.max_restarts} попыток подряд. "
             f"Ошибки: {log_path}"
         )
         return 1

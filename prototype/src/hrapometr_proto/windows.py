@@ -23,6 +23,12 @@ class Window:
     end_s: float
 
 
+def segments_from_doc(doc: dict | list) -> list[Segment]:
+    """Читает segments.json: словарь {"segments": [...]} или старый формат — просто список."""
+    items = doc["segments"] if isinstance(doc, dict) else doc
+    return [Segment(**item) for item in items]
+
+
 def make_windows(
     segments: list[Segment], win_s: float = 30.0, min_partial_s: float = 10.0
 ) -> list[Window]:

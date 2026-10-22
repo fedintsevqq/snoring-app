@@ -68,6 +68,55 @@ def test_recall_interval_is_conservative_and_contains_estimate():
     assert low <= result.recall <= high
 
 
+def test_recall_interval_is_wider_than_naive_corners_of_two_95_percent_intervals():
+    flagged = [True] * 8 + [False] * 2
+    unflagged = [True] + [False] * 9
+    result = estimate_metrics(
+        flagged_total=100, unflagged_total=900, flagged_labels=flagged, unflagged_labels=unflagged
+    )
+    p_lo, p_hi = wilson_interval(8, 10)
+    m_lo, m_hi = wilson_interval(1, 10)
+    naive_low = p_lo * 100 / (p_lo * 100 + m_hi * 900)
+    naive_high = p_hi * 100 / (p_hi * 100 + m_lo * 900)
+    assert result.recall_ci[0] <= naive_low
+    assert result.recall_ci[1] >= naive_high
+
+
+def test_recall_is_none_when_no_snoring_anywhere():
+    result = estimate_metrics(
+        flagged_total=10,
+        unflagged_total=10,
+        flagged_labels=[False, False],
+        unflagged_labels=[False, False],
+    )
+    assert result.precision == 0.0
+    assert result.recall is None
+    assert result.recall_ci is None
+
+
+def test_unsure_ranges_cover_both_extremes():
+    result = estimate_metrics(
+        flagged_total=100,
+        unflagged_total=100,
+        flagged_labels=[True, True, None, None],
+        unflagged_labels=[False, False, None, None],
+    )
+    assert result.precision == 1.0
+    assert result.precision_unsure_range == pytest.approx((0.5, 1.0))
+    assert result.miss_rate == 0.0
+    assert result.miss_rate_unsure_range == pytest.approx((0.0, 0.5))
+    low, high = result.recall_unsure_range
+    assert low < result.recall <= high
+
+
+def test_no_unsure_means_no_unsure_ranges():
+    result = estimate_metrics(
+        flagged_total=10, unflagged_total=10, flagged_labels=[True], unflagged_labels=[False]
+    )
+    assert result.precision_unsure_range is None
+    assert result.recall_unsure_range is None
+
+
 def test_no_labeled_samples_gives_none():
     result = estimate_metrics(
         flagged_total=10, unflagged_total=10, flagged_labels=[None], unflagged_labels=[]

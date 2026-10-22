@@ -41,9 +41,11 @@ _TEMPLATE = """<!doctype html>
 <div id="list"></div>
 <script>
 const RUN = __RUN__;
+const TOKEN = __TOKEN__;
 const CLIPS = __CLIPS__;
 const LABELS = __LABELS__;
-const STORAGE_KEY = "hrapometr-review-" + RUN;
+// токен выборки в ключе: после нового prepare старые ответы не прилипнут к другим клипам
+const STORAGE_KEY = "hrapometr-review-" + RUN + "-" + TOKEN;
 let answers = {};
 try { answers = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}"); } catch (e) { answers = {}; }
 
@@ -81,7 +83,7 @@ CLIPS.forEach((clip, i) => {
 });
 
 document.getElementById("download").addEventListener("click", () => {
-  const blob = new Blob([JSON.stringify({ run: RUN, labels: answers }, null, 2)], { type: "application/json" });
+  const blob = new Blob([JSON.stringify({ run: RUN, token: TOKEN, labels: answers }, null, 2)], { type: "application/json" });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
   a.download = "labels.json";
@@ -94,8 +96,11 @@ save();
 """
 
 
-def render_page(run_name: str, clips: list[dict]) -> str:
-    """clips — список {"id": "c001", "file": "clips/c001.wav"} в порядке показа."""
+def render_page(run_name: str, token: str, clips: list[dict]) -> str:
+    """clips — список {"id": "c001", "file": "clips/c001.wav"} в порядке показа.
+
+    token — метка этой выборки: попадает в ключ localStorage и в labels.json.
+    """
 
     def js(value) -> str:
         # '</' экранируем, чтобы данные не закрыли тег script
@@ -103,6 +108,7 @@ def render_page(run_name: str, clips: list[dict]) -> str:
 
     return (
         _TEMPLATE.replace("__RUN__", js(run_name))
+        .replace("__TOKEN__", js(token))
         .replace("__CLIPS__", js(clips))
         .replace("__LABELS__", js(LABELS))
     )

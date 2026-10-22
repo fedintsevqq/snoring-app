@@ -6,6 +6,9 @@ import math
 from dataclasses import dataclass
 
 _Z95 = 1.96
+# Интервал полноты строим из двух независимых долей. Чтобы вместе они гарантированно покрывали 95%,
+# каждая берётся с покрытием не меньше 97.5% (z = 2.24): 0.975 * 0.975 > 0.95.
+_Z_JOINT95 = 2.24
 
 
 def wilson_interval(successes: int, total: int, z: float = _Z95) -> tuple[float, float]:
@@ -31,6 +34,10 @@ class Metrics:
     miss_rate_ci: tuple[float, float] | None
     recall: float | None
     recall_ci: tuple[float, float] | None
+    # границы, если все «не уверен» оказались бы не храпом или, наоборот, храпом; None, если «не уверен» нет
+    precision_unsure_range: tuple[float, float] | None = None
+    miss_rate_unsure_range: tuple[float, float] | None = None
+    recall_unsure_range: tuple[float, float] | None = None
 
 
 def _share(labels: list[bool | None]) -> tuple[int, int, int]:
@@ -39,10 +46,33 @@ def _share(labels: list[bool | None]) -> tuple[int, int, int]:
     return len(decided), len(labels) - len(decided), sum(decided)
 
 
-def _recall(precision: float, miss_rate: float, flagged_total: int, unflagged_total: int) -> float:
+def _recall(
+    precision: float, miss_rate: float, flagged_total: int, unflagged_total: int
+) -> float | None:
+    """Доля найденного храпа. Если храпа нет нигде, полноту не определить (None)."""
     found = precision * flagged_total
     missed = miss_rate * unflagged_total
-    return found / (found + missed) if found + missed > 0 else 0.0
+    return found / (found + missed) if found + missed > 0 else None
+
+
+def _recall_range(
+    precision_range: tuple[float, float],
+    miss_range: tuple[float, float],
+    flagged_total: int,
+    unflagged_total: int,
+) -> tuple[float, float] | None:
+    low = _recall(precision_range[0], miss_range[1], flagged_total, unflagged_total)
+    high = _recall(precision_range[1], miss_range[0], flagged_total, unflagged_total)
+    if low is None or high is None:
+        return None
+    return (low, high)
+
+
+def _unsure_range(hits: int, decided: int, unsure: int) -> tuple[float, float] | None:
+    total = decided + unsure
+    if total == 0:
+        return None
+    return (hits / total, (hits + unsure) / total)
 
 
 def estimate_metrics(
@@ -57,7 +87,8 @@ def estimate_metrics(
     precision — доля окон с настоящим храпом среди помеченных детектором.
     miss_rate — доля окон с храпом среди непомеченных.
     recall — храп в помеченных / (храп в помеченных + пропущенный храп), группы взвешены размером.
-    Интервал полноты консервативный: берём худшее и лучшее сочетание границ двух долей.
+    Интервал полноты считаем по границам двух долей (z = 2.24), так что он покрывает не меньше 95%.
+    «Не уверен» в оценку не входит, а крайние случаи по ним отдельно: *_unsure_range.
     """
     f_n, f_unsure, f_hits = _share(flagged_labels)
     u_n, u_unsure, u_hits = _share(unflagged_labels)
@@ -70,10 +101,21 @@ def estimate_metrics(
     recall = recall_ci = None
     if precision is not None and miss_rate is not None:
         recall = _recall(precision, miss_rate, flagged_total, unflagged_total)
-        recall_ci = (
-            _recall(precision_ci[0], miss_rate_ci[1], flagged_total, unflagged_total),
-            _recall(precision_ci[1], miss_rate_ci[0], flagged_total, unflagged_total),
-        )
+        if recall is not None:
+            recall_ci = _recall_range(
+                wilson_interval(f_hits, f_n, _Z_JOINT95),
+                wilson_interval(u_hits, u_n, _Z_JOINT95),
+                flagged_total,
+                unflagged_total,
+            )
+
+    precision_unsure_range = miss_rate_unsure_range = recall_unsure_range = None
+    if f_unsure + u_unsure > 0:
+        p_range = _unsure_range(f_hits, f_n, f_unsure)
+        m_range = _unsure_range(u_hits, u_n, u_unsure)
+        precision_unsure_range, miss_rate_unsure_range = p_range, m_range
+        if p_range is not None and m_range is not None:
+            recall_unsure_range = _recall_range(p_range, m_range, flagged_total, unflagged_total)
 
     return Metrics(
         flagged_labeled=f_n,
@@ -86,4 +128,7 @@ def estimate_metrics(
         miss_rate_ci=miss_rate_ci,
         recall=recall,
         recall_ci=recall_ci,
+        precision_unsure_range=precision_unsure_range,
+        miss_rate_unsure_range=miss_rate_unsure_range,
+        recall_unsure_range=recall_unsure_range,
     )

@@ -27,15 +27,19 @@ def apply_gain_db(signal: np.ndarray, gain_db: float) -> np.ndarray:
     return np.clip(signal * np.float32(10.0 ** (gain_db / 20.0)), -1.0, 1.0)
 
 
-def normalize_peak(signal: np.ndarray, target_db: float, max_gain_db: float) -> np.ndarray:
-    """Поднимает самый громкий отсчёт до target_db (dBFS), но не больше чем на max_gain_db.
+def normalize_level(
+    signal: np.ndarray, target_db: float, max_gain_db: float, percentile: float = 99.5
+) -> np.ndarray:
+    """Поднимает типичную громкость клипа до target_db (dBFS), но не больше чем на max_gain_db.
 
+    Опорная громкость — 99.5-й перцентиль модуля, а не максимум: один хлопок двери
+    не должен глушить тихий храп в том же окне. Одиночные выбросы после усиления обрезаются.
     Нужно для прослушивания тихих клипов человеком. Для модели не используется.
     """
-    peak = float(np.max(np.abs(signal))) if signal.size else 0.0
-    if peak == 0.0:
+    reference = float(np.percentile(np.abs(signal), percentile)) if signal.size else 0.0
+    if reference == 0.0:
         return signal.copy()
-    gain_db = min(target_db - 20.0 * np.log10(peak), max_gain_db)
+    gain_db = min(target_db - 20.0 * np.log10(reference), max_gain_db)
     return apply_gain_db(signal, gain_db)
 
 

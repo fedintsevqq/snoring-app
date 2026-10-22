@@ -1,0 +1,13 @@
+node_modules/
+.env
+.env.*
+*.log
+.DS_Store
+Thumbs.db
+target/
+dist/
+.next/
+DerivedData/
+xcuserdata/
+*.wav
+*.opus

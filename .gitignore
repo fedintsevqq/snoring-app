@@ -11,3 +11,21 @@ DerivedData/
 xcuserdata/
 *.wav
 *.opus
+
+# записи ночей, базы и локальные данные: репозиторий публичный, личное сюда не попадает
+*.ogg
+*.m4a
+*.mp3
+*.flac
+*.sqlite
+*.sqlite3
+*.db
+
+# прототип детектора (этап 0)
+prototype/.venv/
+prototype/runs/
+prototype/data/
+prototype/models/
+__pycache__/
+*.egg-info/
+.pytest_cache/

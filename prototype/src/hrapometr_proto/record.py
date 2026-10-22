@@ -97,6 +97,18 @@ def next_segment_number(out_dir: Path) -> int:
     return max(known) + 1 if known else 0
 
 
+MIN_FFMPEG = (4, 4)  # с этой версии есть -stats_period, без него мониторинг прогресса не работает
+
+
+def parse_ffmpeg_version(version_output: str) -> tuple[int, int] | None:
+    """Версия из первой строки `ffmpeg -version` («ffmpeg version 7.1.1», «ffmpeg version n6.0»).
+
+    Для самосборок вида N-113566-g... версию не определить, вернём None.
+    """
+    match = re.search(r"ffmpeg version [nN]?(\d+)\.(\d+)", version_output)
+    return (int(match.group(1)), int(match.group(2))) if match else None
+
+
 def input_level_ok(level_db: float) -> bool:
     """Микрофон отдаёт хоть какой-то звук (комнатный шум выше -90 dBFS), а не цифровую тишину."""
     return level_db > SILENCE_FLOOR_DB
@@ -322,6 +334,15 @@ def main() -> int:
 
     if shutil.which("ffmpeg") is None:
         print("Не найден ffmpeg. Установите: brew install ffmpeg")
+        return 2
+    version = parse_ffmpeg_version(
+        subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, check=False).stdout
+    )
+    if version is not None and version < MIN_FFMPEG:
+        print(
+            f"ffmpeg {version[0]}.{version[1]} слишком старый, нужен {MIN_FFMPEG[0]}.{MIN_FFMPEG[1]} или новее. "
+            "Обновите: brew upgrade ffmpeg"
+        )
         return 2
 
     is_mac = platform.system() == "Darwin"

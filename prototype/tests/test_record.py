@@ -7,6 +7,7 @@ from hrapometr_proto.record import (
     input_level_ok,
     next_segment_number,
     parse_audio_devices,
+    parse_ffmpeg_version,
     parse_on_ac_power,
     parse_progress_line,
     restart_delay,
@@ -35,6 +36,14 @@ class FakeProc:
 
     def finish(self):
         self.alive = False
+
+
+def test_ffmpeg_version_parsing():
+    assert parse_ffmpeg_version("ffmpeg version 7.1.1 Copyright (c) 2000-2025") == (7, 1)
+    assert parse_ffmpeg_version("ffmpeg version n6.0 Copyright") == (6, 0)
+    assert parse_ffmpeg_version("ffmpeg version 9.0.2-full_build-www.gyan.dev") == (9, 0)
+    assert parse_ffmpeg_version("ffmpeg version N-113566-gabcdef Copyright") is None
+    assert parse_ffmpeg_version("") is None
 
 
 def test_command_reports_progress_to_stdout():
